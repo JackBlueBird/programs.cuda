@@ -1,13 +1,35 @@
-#include <iostream>
-#include <cstdlib>
-#include <cstring>
-#include <vector>
-#include "simple_timer.hpp" 
-#include <math.h>
-// cublas headers
-#include<cuda_runtime.h>
-#include<cublas_v2.h>
+// Benchmark of C = A * B on a single GPU with cublas: see the description above main()
 
+#include <iostream>         // std::cout, std::cerr for output and error messages
+#include <cstdlib>          // std::exit on invalid arguments or CUDA/cublas errors
+#include <string>           // std::string, std::stol, std::stoi (argument parsing, timer label)
+#include <vector>           // std::vector for host matrices
+#include "simple_timer.hpp" // SimpleTimer: wall-clock timing and average per label
+#include <cuda_runtime.h>   // cudaMalloc, cudaMemcpy, cudaFree, cudaError_t
+#include <cublas_v2.h>      // cublasCreate, cublasSgemm, cublasDestroy, cublasHandle_t
+
+/*
+    error checking: on failure print file, line and error, then exit
+*/
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                        \
+        cudaError_t err = (call);                                               \
+        if (err != cudaSuccess) {                                               \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__        \
+                      << ": " << cudaGetErrorString(err) << std::endl;          \
+            std::exit(1);                                                       \
+        }                                                                       \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                                      \
+    do {                                                                        \
+        cublasStatus_t status = (call);                                         \
+        if (status != CUBLAS_STATUS_SUCCESS) {                                  \
+            std::cerr << "cuBLAS error at " << __FILE__ << ":" << __LINE__      \
+                      << ": " << cublasGetStatusString(status) << std::endl;    \
+            std::exit(1);                                                       \
+        }                                                                       \
+    } while (0)
 
 /*
     test parameters from command line
@@ -26,52 +48,56 @@ struct HostMatrices {
 };
 
 /*
-    device matrices A, B and C (N x N, row major), c-style pointers, and cublas handler
+    device matrices A, B and C (N x N, row major), c-style pointers, and cublas handle
 */
 struct DeviceMatrices {
-    float *A, *B, *C;
-    cublasHandle_t cuda_handler;
+    float *A = nullptr, *B = nullptr, *C = nullptr;
+    cublasHandle_t cublas_handle = nullptr;
 };
 
 /*
     C = A * B with cublas, A, B and C square N x N row major, already allocated on device
 */
-void cublas_matmul(cublasHandle_t cuda_handler, const float *d_A, const float *d_B, float *d_C, std::size_t N) {
+void cublas_matmul(cublasHandle_t cublas_handle, const float *d_A, const float *d_B, float *d_C, std::size_t N) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    // Perform multiplication alpha * B^T * A^T + beta * C^T = C^T where A, B and C are row major stored
+    // A row major buffer read as col major is the transpose of the matrix.
     // cublas is col major: it reads our row major buffers as A^T, B^T and writes C^T col major,
-    // which in memory is exactly C row major
-    cublasSgemm(cuda_handler,
+    // which in memory is exactly C row major. So we ask for C^T = B^T * A^T (B first, no transposes):
+    // alpha * B^T * A^T + beta * C^T = C^T
+    // In the comments below m, n, k, lda, ldb, ldc are the cublas parameter names, N is our matrix size.
+    CUBLAS_CHECK(cublasSgemm(cublas_handle,
                 CUBLAS_OP_N,
                 CUBLAS_OP_N,
-                N,      // M --> number of Rows of C^T (= Cols of C)
-                N,      // N --> number of Cols of C^T (= Rows of C)
-                N,      // K --> common dimension (Cols of A = Rows of B)
+                N,      // m --> number of Rows of C^T (= Cols of C)
+                N,      // n --> number of Cols of C^T (= Rows of C)
+                N,      // k --> common dimension (Cols of A = Rows of B)
                 &alpha,
                 d_B,    // pointer to B memory storage location (seen by cublas as B^T)
-                N,      // N --> Leading dimension of B (number of cols of B, row major)
+                N,      // ldb --> Leading dimension of B (number of cols of B, row major)
                 d_A,    // pointer to A memory storage location (seen by cublas as A^T)
-                N,      // K --> Leading dimension of A (number of cols of A, row major)
+                N,      // lda --> Leading dimension of A (number of cols of A, row major)
                 &beta,
                 d_C,    // pointer to C memory storage location (written by cublas as C^T)
-                N);     // N --> Leading dimension of C (number of cols of C, row major)
+                N));    // ldc --> Leading dimension of C (number of cols of C, row major)
 }
 
 /*
-    H2D copy + C = A * B with cublas + D2H copy, device matrices already allocated
+    copy host -> device (H2D) + C = A * B with cublas + copy device -> host (D2H), device matrices already allocated
 */
 void cublas_matmul_with_transfer(HostMatrices &host, DeviceMatrices &dev, std::size_t N) {
     // Copy matrices from host to device
-    cudaMemcpy(dev.A, host.A.data(), N * N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev.B, host.B.data(), N * N * sizeof(float), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(dev.A, host.A.data(), N * N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dev.B, host.B.data(), N * N * sizeof(float), cudaMemcpyHostToDevice));
 
     // Perform multiplication
-    cublas_matmul(dev.cuda_handler, dev.A, dev.B, dev.C, N);
+    cublas_matmul(dev.cublas_handle, dev.A, dev.B, dev.C, N);
 
-    // Copy the result back to host
-    cudaMemcpy(host.C.data(), dev.C, N * N * sizeof(float), cudaMemcpyDeviceToHost);
+    // Copy the result back to host.
+    // cublas calls are asynchronous (return before the GPU finishes): this cudaMemcpy waits
+    // for the multiplication to end, so when this function returns all GPU work is done
+    CUDA_CHECK(cudaMemcpy(host.C.data(), dev.C, N * N * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 /*
@@ -115,25 +141,25 @@ HostMatrices setup_host(std::size_t N) {
 }
 
 /*
-    allocate device matrices A, B and C (N x N) and create the cublas handler
+    allocate device matrices A, B and C (N x N) and create the cublas handle
 */
 DeviceMatrices setup_device(std::size_t N) {
     DeviceMatrices dev;
-    cudaMalloc((void**)&dev.A, N * N * sizeof(float));
-    cudaMalloc((void**)&dev.B, N * N * sizeof(float));
-    cudaMalloc((void**)&dev.C, N * N * sizeof(float));
-    cublasCreate(&dev.cuda_handler);
+    CUDA_CHECK(cudaMalloc((void**)&dev.A, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&dev.B, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&dev.C, N * N * sizeof(float)));
+    CUBLAS_CHECK(cublasCreate(&dev.cublas_handle));
     return dev;
 }
 
 /*
-    destroy the cublas handler and free device matrices
+    destroy the cublas handle and free device matrices
 */
 void cleanup_device(DeviceMatrices &dev) {
-    cublasDestroy(dev.cuda_handler);
-    cudaFree(dev.A);
-    cudaFree(dev.B);
-    cudaFree(dev.C);
+    CUBLAS_CHECK(cublasDestroy(dev.cublas_handle));
+    CUDA_CHECK(cudaFree(dev.A));
+    CUDA_CHECK(cudaFree(dev.B));
+    CUDA_CHECK(cudaFree(dev.C));
 }
 
 /*
@@ -144,10 +170,40 @@ void print_results(std::size_t N, const HostMatrices &host, const std::string &t
     // average time per call in microseconds (double, no truncation)
     double avg_time = SimpleTimer::average_us(timer_label);
     // flops / (time_us * 1e-6) / 1e9 = flops / (time_us * 1e3)
-    std::cout << "giga flops/s (CUBLAS): " << 2.0*N*N*N / (avg_time * 1e3) << std::endl;
+    std::cout << "giga flops/s (" << timer_label << "): " << 2.0*N*N*N / (avg_time * 1e3) << std::endl;
     SimpleTimer::print_timing_results();
 }
 
+/*
+    Start reading here, then main, then the helper functions above.
+
+    This program runs a benchmark for C = A * B executed on a single GPU:
+    square N x N float matrices, multiplied with cublas, timed over several iterations.
+
+    Flow:
+    - allocate matrices on host (CPU)
+    - copy A and B to device (GPU)
+    - multiply C = A * B on device
+    - copy C back to host
+
+    Main terms:
+    host            CPU and its RAM
+    device          GPU and its memory (VRAM)
+    H2D / D2H       copy host -> device / device -> host (cudaMemcpy)
+    cudaMalloc      allocates memory on device; the pointer is valid only on device (do not dereference it on host)
+    cudaFree        frees device memory
+    cublas          NVIDIA linear algebra library (BLAS on GPU)
+    cublas handle   cublas context, created once (cublasCreate) and passed to every cublas call
+    Sgemm           single precision (float) general matrix-matrix multiply: C = alpha * A * B + beta * C
+    row major       matrix stored row after row (C/C++); col major: column after column (Fortran, BLAS, cublas)
+    leading dim.    memory distance between the start of two consecutive rows (row major) or columns (col major)
+    asynchronous    cublas calls return before the GPU has finished; a later sync point (e.g. cudaMemcpy) waits
+    warm up         untimed calls before measuring, to exclude one-time initialization costs
+    GFLOP/s         10^9 floating point operations per second; matmul does 2*N^3 (N^3 multiplications + N^3 additions)
+
+    Compile: nvcc -std=c++17 -arch=sm_89 -I. matrix_multiply_REDONE.cu -lcublas -o matrix_multiply_REDONE.x
+    Run:     ./matrix_multiply_REDONE.x <N> <iterations>
+*/
 int main(int argc, char* argv[]) {
     TestConfig config = read_arguments(argc, argv);
     HostMatrices host = setup_host(config.N);
@@ -159,12 +215,13 @@ int main(int argc, char* argv[]) {
     }
 
     // Time computation + memory copy
+    const std::string timer_label = "CUBLAS -- computation + data transfer";
     for (int i = 0; i < config.n_iterations; ++i) {
-        SimpleTimer t{"CUBLAS -- computation + data transfer"};
+        SimpleTimer t{timer_label};
         cublas_matmul_with_transfer(host, dev, config.N);
     }
 
-    print_results(config.N, host, "CUBLAS -- computation + data transfer");
+    print_results(config.N, host, timer_label);
     cleanup_device(dev);
     return 0;
 }
