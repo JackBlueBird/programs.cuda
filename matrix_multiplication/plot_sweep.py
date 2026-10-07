@@ -3,10 +3,11 @@
 Read the CSV produced by run_sweep.py and create, as a function of the matrix size N:
 - <prefix>_gflops.png and <prefix>_avg_time.png: GFLOP/s and average time, one figure each
 - <prefix>_overview.png: one figure with a panel per logged quantity:
-- GFLOP/s and average time per iteration (always present)
-- SM clock average and minimum, maximum temperature, average power (GPU monitor columns;
-  panels are skipped if the CSV has no monitor data, e.g. run with --no-monitor)
-The throttle column is text, not a number: it is not plotted.
+  GFLOP/s, average time, SM clock average and minimum, maximum temperature, average power.
+  Monitor values can be missing for some N (short runs with no active GPU sample): those points
+  are skipped; a panel with no data at all (e.g. sweep run with --no-monitor) is not drawn.
+
+The helpers here (PANELS, read_csv, style_axes, overview_grid) are also used by compare_sweeps.py.
 
 usage:
     python3 plot_sweep.py                                       # reads sweep_results.csv -> sweep_*.png
@@ -32,16 +33,16 @@ SURFACE = "#fcfcfb"
 PANELS = [
     ("gflops",           "Performance (computation + data transfer)", "GFLOP/s",   1.0,   "{:.0f}"),
     ("avg_time_us",      "Average time per iteration",                "time [ms]", 1e-3,  "{:.1f} ms"),
-    ("sm_clock_avg_mhz", "SM clock, average",                         "MHz",       1.0,   "{:.0f} MHz"),
-    ("sm_clock_min_mhz", "SM clock, minimum",                         "MHz",       1.0,   "{:.0f} MHz"),
+    ("sm_clock_avg_mhz", "SM clock, average (GPU active)",            "MHz",       1.0,   "{:.0f} MHz"),
+    ("sm_clock_min_mhz", "SM clock, minimum (GPU active)",            "MHz",       1.0,   "{:.0f} MHz"),
     ("temp_max_c",       "GPU temperature, maximum",                  "°C",        1.0,   "{:.0f} °C"),
-    ("power_avg_w",      "GPU power, average",                        "W",         1.0,   "{:.1f} W"),
+    ("power_avg_w",      "GPU power, average (GPU active)",           "W",         1.0,   "{:.1f} W"),
 ]
 N_COLS = 2
 
 
 def read_csv(path):
-    """return list N and dict column -> list of values (None where the cell is empty)"""
+    """return list N and dict column -> list of values (None where the cell is empty or missing)"""
     N = []
     columns = {name: [] for name, *_ in PANELS}
     try:
@@ -58,20 +59,18 @@ def read_csv(path):
     return N, columns
 
 
-def draw_panel(ax, x, y, title, ylabel, value_format):
-    """single series line panel, value labelled only on the last point"""
+def valid_points(x, y):
+    """drop the points where y is missing"""
+    pairs = [(a, b) for a, b in zip(x, y) if b is not None]
+    return [a for a, _ in pairs], [b for _, b in pairs]
+
+
+def style_axes(ax, title, ylabel, ymax):
+    """common look: title, y from 0, recessive grid and axes"""
     ax.set_facecolor(SURFACE)
-    ax.plot(x, y, color=LINE_COLOR, linewidth=2, marker="o", markersize=4)
-
-    # direct label on the last point only
-    ax.annotate(value_format.format(y[-1]), (x[-1], y[-1]), textcoords="offset points",
-                xytext=(0, 8), ha="center", color=TEXT_PRIMARY, fontsize=8)
-
     ax.set_title(title, color=TEXT_PRIMARY, loc="left", fontsize=10)
     ax.set_ylabel(ylabel, color=TEXT_SECONDARY)
-    ax.set_ylim(bottom=0, top=max(y) * 1.12)  # headroom for the last value label
-
-    # recessive grid and axes
+    ax.set_ylim(bottom=0, top=ymax * 1.12)  # headroom for value labels
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
@@ -79,6 +78,41 @@ def draw_panel(ax, x, y, title, ylabel, value_format):
     for side in ("left", "bottom"):
         ax.spines[side].set_color(GRID_COLOR)
     ax.tick_params(colors=TEXT_SECONDARY, labelsize=8)
+
+
+def draw_panel(ax, x, y, title, ylabel, value_format):
+    """single series line panel, value labelled only on the last point"""
+    x, y = valid_points(x, y)
+    ax.plot(x, y, color=LINE_COLOR, linewidth=2, marker="o", markersize=4)
+    ax.annotate(value_format.format(y[-1]), (x[-1], y[-1]), textcoords="offset points",
+                xytext=(0, 8), ha="center", color=TEXT_PRIMARY, fontsize=8)
+    style_axes(ax, title, ylabel, max(y))
+
+
+def overview_grid(n_panels):
+    """figure with n_panels panels on N_COLS columns, shared x axis; returns fig and the used axes"""
+    n_rows = math.ceil(n_panels / N_COLS)
+    fig, axes = plt.subplots(n_rows, N_COLS, figsize=(11, 3.2 * n_rows),
+                             sharex=True, facecolor=SURFACE, squeeze=False)
+    axes = axes.flatten()
+    for ax in axes[n_panels:]:
+        ax.set_visible(False)  # empty slot when the number of panels is odd
+    axes = axes[:n_panels]
+    # shared x axis: at most ~10 readable ticks, tick labels everywhere, axis label on the bottom row
+    axes[0].xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
+    for ax in axes:
+        ax.tick_params(labelbottom=True)
+    for ax in axes[-N_COLS:]:
+        ax.set_xlabel("matrix size N", color=TEXT_SECONDARY)
+    return fig, axes
+
+
+def save(fig, filename, top=1.0):
+    """top < 1 leaves room above the panels (e.g. for a figure legend)"""
+    fig.tight_layout(rect=(0, 0, 1, top))
+    fig.savefig(filename, dpi=150)
+    plt.close(fig)
+    print(f"Saved {filename}")
 
 
 def single_plot(N, y, title, ylabel, value_format, filename):
@@ -89,46 +123,25 @@ def single_plot(N, y, title, ylabel, value_format, filename):
     ax.set_xlabel("matrix size N", color=TEXT_SECONDARY)
     # at most ~10 readable ticks, whatever the number of points
     ax.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
-    fig.tight_layout()
-    fig.savefig(filename, dpi=150)
-    plt.close(fig)
-    print(f"Saved {filename}")
+    save(fig, filename)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot all logged quantities from the sweep CSV in one figure")
+    parser = argparse.ArgumentParser(description="Plot all logged quantities from the sweep CSV")
     parser.add_argument("--input", default="sweep_results.csv", help="CSV from run_sweep.py (default: sweep_results.csv)")
-    parser.add_argument("--prefix", default="sweep", help="prefix of the PNG file (default: sweep)")
+    parser.add_argument("--prefix", default="sweep", help="prefix of the PNG files (default: sweep)")
     args = parser.parse_args()
 
     N, columns = read_csv(args.input)
 
-    # keep only panels with data in every row (monitor columns may be empty)
-    panels = [p for p in PANELS if all(v is not None for v in columns[p[0]])]
+    # keep only panels with at least one value (monitor columns may be empty)
+    panels = [p for p in PANELS if any(v is not None for v in columns[p[0]])]
 
-    n_rows = math.ceil(len(panels) / N_COLS)
-    fig, axes = plt.subplots(n_rows, N_COLS, figsize=(11, 3.2 * n_rows),
-                             sharex=True, facecolor=SURFACE, squeeze=False)
-    axes = axes.flatten()
-
+    fig, axes = overview_grid(len(panels))
     for ax, (name, title, ylabel, _, value_format) in zip(axes, panels):
         draw_panel(ax, N, columns[name], title, ylabel, value_format)
-    for ax in axes[len(panels):]:
-        ax.set_visible(False)  # empty slot when the number of panels is odd
-
-    # shared x axis: at most ~10 readable ticks, label on the bottom row only
-    axes[0].xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
-    for ax in axes[:len(panels)]:
-        ax.tick_params(labelbottom=True)
-    for ax in axes[len(panels) - N_COLS:len(panels)]:
-        ax.set_xlabel("matrix size N", color=TEXT_SECONDARY)
-
     fig.suptitle(f"cuBLAS SGEMM sweep ({args.input})", color=TEXT_PRIMARY, x=0.01, ha="left", fontsize=12)
-    fig.tight_layout()
-    filename = f"{args.prefix}_overview.png"
-    fig.savefig(filename, dpi=150)
-    plt.close(fig)
-    print(f"Saved {filename}")
+    save(fig, f"{args.prefix}_overview.png")
 
     # GFLOP/s and average time also as separate figures
     single_plot(N, columns["gflops"], "cuBLAS SGEMM performance (computation + data transfer)",

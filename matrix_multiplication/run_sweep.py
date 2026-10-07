@@ -6,10 +6,15 @@ The executable must already be compiled (e.g. with ./compile_and_run.sh).
 If the `module` command exists (cluster), the CUDA module is loaded in the same shell
 that runs the executable; locally (no modules) the executable is run directly.
 
-While each run executes, the GPU is sampled with NVML (package nvidia-ml-py, imported as pynvml):
-SM clock, temperature, power and throttle reasons are summarized per N in the CSV.
+While each run executes, the GPU is sampled with NVML (package nvidia-ml-py, imported as pynvml)
+every SAMPLE_INTERVAL_S seconds. Per N the CSV gets:
+- SM clock average / minimum and power average over the ACTIVE samples only
+  (GPU utilization >= ACTIVE_UTIL_PCT), so idle phases (program start-up, matrix generation on CPU,
+  verification) do not dilute them; empty if no sample was active (very short runs)
+- maximum temperature over all samples
+- enforced power limit (the power cap applied by driver / power mode)
+- percentage of active samples with each throttle reason (power, thermal, hardware slowdown)
 If pynvml is not installed (or --no-monitor is given) those columns are left empty.
-Note: samples cover the whole run of the executable (start-up, warm up, timed iterations, verification).
 
 usage:
     python3 run_sweep.py                                  # N = 500, 1000, ..., 15000
@@ -34,6 +39,7 @@ MODULE = "cuda/12.9"
 MAX_N = 15000  # safety limit: 3 float matrices of N x N = 12 * N^2 bytes on host and device
 GPU_INDEX = 0  # GPU sampled by the monitor
 SAMPLE_INTERVAL_S = 0.1
+ACTIVE_UTIL_PCT = 50  # a sample counts as "GPU active" at or above this utilization
 
 # lines printed by the program, e.g.
 #   giga flops/s (CUBLAS -- computation + data transfer): 834.376
@@ -46,8 +52,11 @@ POWER_REASONS = 0x4 | 0x80     # SwPowerCap | HwPowerBrakeSlowdown
 THERMAL_REASONS = 0x20 | 0x40  # SwThermalSlowdown | HwThermalSlowdown
 HW_SLOWDOWN = 0x8              # HwSlowdown (thermal or power, reported by hardware)
 
-CSV_HEADER = ["N", "iterations", "avg_time_us", "gflops",
-              "sm_clock_avg_mhz", "sm_clock_min_mhz", "temp_max_c", "power_avg_w", "throttle"]
+MONITOR_COLUMNS = ["active_samples", "sm_clock_avg_mhz", "sm_clock_min_mhz", "temp_max_c",
+                   "power_avg_w", "power_limit_w",
+                   "throttle_power_pct", "throttle_thermal_pct", "throttle_hw_pct"]
+CSV_HEADER = ["N", "iterations", "avg_time_us", "gflops"] + MONITOR_COLUMNS
+EMPTY_MONITOR = {name: "" for name in MONITOR_COLUMNS}
 
 
 class GpuMonitor:
@@ -55,7 +64,9 @@ class GpuMonitor:
 
     def __init__(self, handle):
         self.handle = handle
-        self.samples = []  # (sm clock MHz, temperature C, power W, throttle reasons bitmask)
+        # (sm clock MHz, temperature C, power W, utilization %, throttle reasons bitmask)
+        self.samples = []
+        self.power_limit_w = None
         self._stop = threading.Event()
         self._thread = None
 
@@ -71,37 +82,45 @@ class GpuMonitor:
             clock = pynvml.nvmlDeviceGetClockInfo(self.handle, pynvml.NVML_CLOCK_SM)
             temp = pynvml.nvmlDeviceGetTemperature(self.handle, pynvml.NVML_TEMPERATURE_GPU)
             power = pynvml.nvmlDeviceGetPowerUsage(self.handle) / 1000.0  # mW -> W
-            self.samples.append((clock, temp, power, self._read_reasons()))
+            util = pynvml.nvmlDeviceGetUtilizationRates(self.handle).gpu  # % of time a kernel was running
+            self.samples.append((clock, temp, power, util, self._read_reasons()))
             self._stop.wait(SAMPLE_INTERVAL_S)
 
     def start(self):
         self.samples = []
+        # power cap applied now (depends on driver and laptop power mode)
+        self.power_limit_w = pynvml.nvmlDeviceGetEnforcedPowerLimit(self.handle) / 1000.0  # mW -> W
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self):
-        """stop sampling and return the summary columns for the CSV"""
+        """stop sampling and return the summary columns for the CSV, as a dict"""
         self._stop.set()
         self._thread.join()
+        summary = dict(EMPTY_MONITOR)
         if not self.samples:
-            return ["", "", "", "", ""]
-        clocks = [s[0] for s in self.samples]
-        reasons = 0
-        for s in self.samples:
-            reasons |= s[3]
-        throttle = []
-        if reasons & POWER_REASONS:
-            throttle.append("power")
-        if reasons & THERMAL_REASONS:
-            throttle.append("thermal")
-        if reasons & HW_SLOWDOWN:
-            throttle.append("hw_slowdown")
-        return [round(sum(clocks) / len(clocks)),
-                min(clocks),
-                max(s[1] for s in self.samples),
-                round(sum(s[2] for s in self.samples) / len(self.samples), 1),
-                "+".join(throttle) if throttle else "none"]
+            return summary
+        summary["temp_max_c"] = max(s[1] for s in self.samples)
+        summary["power_limit_w"] = round(self.power_limit_w, 1)
+
+        active = [s for s in self.samples if s[3] >= ACTIVE_UTIL_PCT]
+        summary["active_samples"] = len(active)
+        if not active:
+            return summary  # run too short to catch the GPU working: clock/power/throttle left empty
+
+        def pct(mask):
+            """percentage of active samples with any of the reason bits in mask"""
+            return round(100.0 * sum(1 for s in active if s[4] & mask) / len(active))
+
+        clocks = [s[0] for s in active]
+        summary["sm_clock_avg_mhz"] = round(sum(clocks) / len(clocks))
+        summary["sm_clock_min_mhz"] = min(clocks)
+        summary["power_avg_w"] = round(sum(s[2] for s in active) / len(active), 1)
+        summary["throttle_power_pct"] = pct(POWER_REASONS)
+        summary["throttle_thermal_pct"] = pct(THERMAL_REASONS)
+        summary["throttle_hw_pct"] = pct(HW_SLOWDOWN)
+        return summary
 
 
 def build_command(N, iterations, warmup):
@@ -141,7 +160,7 @@ def create_monitor(enabled):
 def main():
     parser = argparse.ArgumentParser(description="Sweep of matrix_multiply_REDONE.x over matrix sizes")
     parser.add_argument("--sizes", type=int, nargs="+", default=list(range(500, 15001, 500)),
-                        help="matrix sizes N (default: 500 1000 ... 10000)")
+                        help="matrix sizes N (default: 500 1000 ... 15000)")
     parser.add_argument("--iterations", type=int, default=10, help="timed iterations per run (default: 10)")
     parser.add_argument("--warmup", type=int, default=10, help="warm up iterations (default: 10)")
     parser.add_argument("--output", default="sweep_results.csv", help="output CSV file (default: sweep_results.csv)")
@@ -164,11 +183,15 @@ def main():
                 if monitor:
                     monitor.start()
                 avg_time, gflops = run_one(N, args.iterations, args.warmup)
-                gpu = monitor.stop() if monitor else ["", "", "", "", ""]
-                writer.writerow([N, args.iterations, avg_time, gflops] + gpu)
+                gpu = monitor.stop() if monitor else EMPTY_MONITOR
+                writer.writerow([N, args.iterations, avg_time, gflops] + [gpu[c] for c in MONITOR_COLUMNS])
                 line = f"N = {N:6d}   avg time = {avg_time:12.1f} us   {gflops:10.2f} GFLOP/s"
                 if monitor:
-                    line += f"   SM clock avg {gpu[0]} MHz (min {gpu[1]})   {gpu[2]} C   {gpu[3]} W   throttle: {gpu[4]}"
+                    line += (f"   active samples {gpu['active_samples']}"
+                             f"   SM clock avg {gpu['sm_clock_avg_mhz']} MHz (min {gpu['sm_clock_min_mhz']})"
+                             f"   {gpu['temp_max_c']} C   {gpu['power_avg_w']} W (limit {gpu['power_limit_w']} W)"
+                             f"   throttle % power {gpu['throttle_power_pct']}"
+                             f" thermal {gpu['throttle_thermal_pct']} hw {gpu['throttle_hw_pct']}")
                 print(line)
     finally:
         if monitor:
