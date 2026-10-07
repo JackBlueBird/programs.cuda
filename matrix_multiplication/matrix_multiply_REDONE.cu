@@ -4,6 +4,10 @@
 #include <cstdlib>          // std::exit on invalid arguments or CUDA/cublas errors
 #include <string>           // std::string, std::stol, std::stoi (argument parsing, timer label)
 #include <vector>           // std::vector for host matrices
+#include <random>           // std::mt19937, uniform distributions: random matrices and sample positions
+#include <cmath>            // std::abs for the verification errors
+#include <cfloat>           // FLT_EPSILON for the verification tolerance
+#include <algorithm>        // std::max, std::min in the verification
 #include "simple_timer.hpp" // SimpleTimer: wall-clock timing and average per label
 #include <cuda_runtime.h>   // cudaMalloc, cudaMemcpy, cudaFree, cudaError_t
 #include <cublas_v2.h>      // cublasCreate, cublasSgemm, cublasDestroy, cublasHandle_t
@@ -138,14 +142,55 @@ TestConfig read_arguments(int argc, char* argv[]) {
 }
 
 /*
-    allocate host matrices A, B and C (N x N, row major), set to zero
+    allocate host matrices A, B and C (N x N, row major)
+    A and B: random values uniform in [-1, 1] with a fixed seed (same matrices at every run)
+    C: zero, it is the output
 */
 HostMatrices setup_host(std::size_t N) {
     HostMatrices host;
-    host.A.assign(N * N, 0.0f);
-    host.B.assign(N * N, 0.0f);
+    host.A.resize(N * N);
+    host.B.resize(N * N);
     host.C.assign(N * N, 0.0f);
+
+    std::mt19937 gen(42);                                   // fixed seed -> reproducible
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : host.A) x = dist(gen);
+    for (auto &x : host.B) x = dist(gen);
     return host;
+}
+
+/*
+    check C = A * B on a random sample of elements, recomputed on CPU in double precision
+    error of each element relative to sum_k |A[i][k] * B[k][j]|, tolerance N * FLT_EPSILON
+    (bound for the rounding error of a float dot product of length N)
+    returns true if all sampled elements are within the tolerance
+*/
+bool verify_result(std::size_t N, const HostMatrices &host, std::size_t n_samples = 100) {
+    n_samples = std::min(n_samples, N * N);
+    const double tolerance = N * static_cast<double>(FLT_EPSILON);
+
+    std::mt19937 gen(123);                                  // different seed from the matrices
+    std::uniform_int_distribution<std::size_t> index(0, N - 1);
+
+    double max_error = 0.0;
+    for (std::size_t s = 0; s < n_samples; ++s) {
+        std::size_t i = index(gen);
+        std::size_t j = index(gen);
+        double reference = 0.0;
+        double scale = 0.0;
+        for (std::size_t k = 0; k < N; ++k) {
+            double product = static_cast<double>(host.A[i * N + k]) * host.B[k * N + j];
+            reference += product;
+            scale += std::abs(product);
+        }
+        double error = std::abs(host.C[i * N + j] - reference) / scale;
+        max_error = std::max(max_error, error);
+    }
+
+    bool passed = max_error <= tolerance;
+    std::cout << "Verification on " << n_samples << " elements: max relative error = " << max_error
+              << " (tolerance " << tolerance << ") -> " << (passed ? "PASSED" : "FAILED") << std::endl;
+    return passed;
 }
 
 /*
@@ -189,10 +234,11 @@ void print_results(std::size_t N, const HostMatrices &host, const std::string &t
     square N x N float matrices, multiplied with cublas, timed over several iterations.
 
     Flow:
-    - allocate matrices on host (CPU)
+    - allocate matrices on host (CPU), A and B filled with random values
     - copy A and B to device (GPU)
     - multiply C = A * B on device
     - copy C back to host
+    - verify a random sample of C against a CPU computation
 
     Main terms:
     host            CPU and its RAM
@@ -229,7 +275,10 @@ int main(int argc, char* argv[]) {
         cublas_matmul_with_transfer(host, dev, config.N);
     }
 
+    // Check the result of the last iteration (outside the timer)
+    bool passed = verify_result(config.N, host);
+
     print_results(config.N, host, timer_label);
     cleanup_device(dev);
-    return 0;
+    return passed ? 0 : 1;
 }
