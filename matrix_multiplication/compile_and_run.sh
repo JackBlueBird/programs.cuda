@@ -1,0 +1,16 @@
+#!/bin/bash
+# usage: ./compile_and_run.sh [N]   (default N=1000)
+set -e
+
+# on the cluster load the CUDA module; locally use /usr/local/cuda
+if command -v module > /dev/null 2>&1; then
+    module load cuda/12.9
+else
+    export PATH=/usr/local/cuda/bin:$PATH
+fi
+
+N=${1:-1000}
+
+# sm_89 = Ada (RTX 4050 laptop); change for other GPUs (e.g. sm_86 on the cluster)
+nvcc -std=c++17 -arch=sm_89 -o matrix_multiply_REDONE.x matrix_multiply_REDONE.cu -I. -lcublas
+./matrix_multiply_REDONE.x "$N"
