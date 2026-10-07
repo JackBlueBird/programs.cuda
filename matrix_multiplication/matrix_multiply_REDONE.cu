@@ -37,7 +37,7 @@
 struct TestConfig {
     std::size_t N;      // size of the square matrices
     int n_iterations;   // number of timed iterations
-    int n_warmup = 5;   // number of untimed warm up iterations, fixed
+    int n_warmup = 5;   // number of untimed warm up iterations, default 5, optional 3rd argument
 };
 
 /*
@@ -101,19 +101,24 @@ void cublas_matmul_with_transfer(HostMatrices &host, DeviceMatrices &dev, std::s
 }
 
 /*
-    read command line arguments: matrix size N and number of timed iterations
+    read command line arguments: matrix size N, number of timed iterations,
+    optional number of warm up iterations (default 5)
     exits the program if arguments are missing or not valid
 */
 TestConfig read_arguments(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <matrix size N> <number of iterations>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <matrix size N> <number of iterations> [number of warm up iterations, default 5]" << std::endl;
         std::exit(1);
     }
+    TestConfig config;
     long N;
     int n_iterations;
     try {
         N = std::stol(argv[1]);
         n_iterations = std::stoi(argv[2]);
+        if (argc > 3) {
+            config.n_warmup = std::stoi(argv[3]);
+        }
     } catch (const std::exception &e) {
         std::cerr << "Arguments must be integer numbers." << std::endl;
         std::exit(1);
@@ -123,7 +128,10 @@ TestConfig read_arguments(int argc, char* argv[]) {
         std::cerr << "Matrix size and number of iterations must be positive." << std::endl;
         std::exit(1);
     }
-    TestConfig config;
+    if (config.n_warmup < 0) {
+        std::cerr << "Number of warm up iterations cannot be negative." << std::endl;
+        std::exit(1);
+    }
     config.N = static_cast<std::size_t>(N);
     config.n_iterations = n_iterations;
     return config;
@@ -202,7 +210,7 @@ void print_results(std::size_t N, const HostMatrices &host, const std::string &t
     GFLOP/s         10^9 floating point operations per second; matmul does 2*N^3 (N^3 multiplications + N^3 additions)
 
     Compile: nvcc -std=c++17 -arch=sm_89 -I. matrix_multiply_REDONE.cu -lcublas -o matrix_multiply_REDONE.x
-    Run:     ./matrix_multiply_REDONE.x <N> <iterations>
+    Run:     ./matrix_multiply_REDONE.x <N> <iterations> [warm up iterations, default 5]
 */
 int main(int argc, char* argv[]) {
     TestConfig config = read_arguments(argc, argv);
