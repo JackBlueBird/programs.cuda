@@ -216,14 +216,16 @@ void cleanup_device(DeviceMatrices &dev) {
 }
 
 /*
-    print C[0][0], average giga flops/s for the given timer label and the timing table
+    print C[0][0], average giga flops/s for each timer label and the timing table
 */
-void print_results(std::size_t N, const HostMatrices &host, const std::string &timer_label) {
+void print_results(std::size_t N, const HostMatrices &host, const std::vector<std::string> &timer_labels) {
     std::cout << "Result matrix C[0][0] = " << host.C[0] << std::endl;
-    // average time per call in microseconds (double, no truncation)
-    double avg_time = SimpleTimer::average_us(timer_label);
-    // flops / (time_us * 1e-6) / 1e9 = flops / (time_us * 1e3)
-    std::cout << "giga flops/s (" << timer_label << "): " << 2.0*N*N*N / (avg_time * 1e3) << std::endl;
+    for (const auto &label : timer_labels) {
+        // average time per call in microseconds (double, no truncation)
+        double avg_time = SimpleTimer::average_us(label);
+        // flops / (time_us * 1e-6) / 1e9 = flops / (time_us * 1e3)
+        std::cout << "giga flops/s (" << label << "): " << 2.0*N*N*N / (avg_time * 1e3) << std::endl;
+    }
     SimpleTimer::print_timing_results();
 }
 
@@ -238,6 +240,7 @@ void print_results(std::size_t N, const HostMatrices &host, const std::string &t
     - copy A and B to device (GPU)
     - multiply C = A * B on device
     - copy C back to host
+    - timed twice: copies + multiplication, then multiplication only (data already on device)
     - verify a random sample of C against a CPU computation
 
     Main terms:
@@ -269,16 +272,25 @@ int main(int argc, char* argv[]) {
     }
 
     // Time computation + memory copy
-    const std::string timer_label = "CUBLAS -- computation + data transfer";
+    const std::string label_transfer = "CUBLAS -- computation + data transfer";
     for (int i = 0; i < config.n_iterations; ++i) {
-        SimpleTimer t{timer_label};
+        SimpleTimer t{label_transfer};
         cublas_matmul_with_transfer(host, dev, config.N);
     }
 
-    // Check the result of the last iteration (outside the timer)
+    // Time computation only: A and B are already on device from the loop above.
+    // cublas is asynchronous: cudaDeviceSynchronize waits for the GPU before the timer stops
+    const std::string label_compute = "CUBLAS -- computation only";
+    for (int i = 0; i < config.n_iterations; ++i) {
+        SimpleTimer t{label_compute};
+        cublas_matmul(dev.cublas_handle, dev.A, dev.B, dev.C, config.N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    // Check the result copied back by the last "computation + data transfer" iteration (outside the timers)
     bool passed = verify_result(config.N, host);
 
-    print_results(config.N, host, timer_label);
+    print_results(config.N, host, {label_transfer, label_compute});
     cleanup_device(dev);
     return passed ? 0 : 1;
 }

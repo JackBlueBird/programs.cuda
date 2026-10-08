@@ -41,11 +41,19 @@ GPU_INDEX = 0  # GPU sampled by the monitor
 SAMPLE_INTERVAL_S = 0.1
 ACTIVE_UTIL_PCT = 50  # a sample counts as "GPU active" at or above this utilization
 
-# lines printed by the program, e.g.
-#   giga flops/s (CUBLAS -- computation + data transfer): 834.376
-#   CUBLAS -- computation + data transfer -> Total time: 11985 μs, Average time: 2397 μs, Calls: 5
-GFLOPS_RE = re.compile(r"giga flops/s \(.*\):\s*([0-9.eE+-]+)")
-AVG_TIME_RE = re.compile(r"Average time:\s*([0-9.eE+-]+)")
+# timer labels printed by the program, one per measurement
+LABEL_TRANSFER = "CUBLAS -- computation + data transfer"
+LABEL_COMPUTE = "CUBLAS -- computation only"
+
+
+def gflops_re(label):
+    """matches e.g. 'giga flops/s (CUBLAS -- computation only): 834.376'"""
+    return re.compile(r"giga flops/s \(" + re.escape(label) + r"\):\s*([0-9.eE+-]+)")
+
+
+def avg_time_re(label):
+    """matches e.g. 'CUBLAS -- computation only -> Total time: 11985 μs, Average time: 2397 μs, Calls: 5'"""
+    return re.compile(re.escape(label) + r" -> Total time:.*?Average time:\s*([0-9.eE+-]+)")
 
 # NVML throttle reason bits (nvml.h, nvmlClocksThrottleReason* / nvmlClocksEventReason*)
 POWER_REASONS = 0x4 | 0x80     # SwPowerCap | HwPowerBrakeSlowdown
@@ -55,7 +63,9 @@ HW_SLOWDOWN = 0x8              # HwSlowdown (thermal or power, reported by hardw
 MONITOR_COLUMNS = ["active_samples", "sm_clock_avg_mhz", "sm_clock_min_mhz", "temp_max_c",
                    "power_avg_w", "power_limit_w",
                    "throttle_power_pct", "throttle_thermal_pct", "throttle_hw_pct"]
-CSV_HEADER = ["N", "iterations", "avg_time_us", "gflops"] + MONITOR_COLUMNS
+# avg_time_us / gflops: computation + data transfer; compute_*: computation only
+TIMING_COLUMNS = ["avg_time_us", "gflops", "compute_time_us", "compute_gflops"]
+CSV_HEADER = ["N", "iterations"] + TIMING_COLUMNS + MONITOR_COLUMNS
 EMPTY_MONITOR = {name: "" for name in MONITOR_COLUMNS}
 
 
@@ -133,17 +143,22 @@ def build_command(N, iterations, warmup):
 
 
 def run_one(N, iterations, warmup):
-    """run the executable once, return (average time in us, GFLOP/s)"""
+    """run the executable once, return dict TIMING_COLUMNS -> value"""
     result = subprocess.run(["bash", "-lc", build_command(N, iterations, warmup)],
                             capture_output=True, text=True)
     if result.returncode != 0:
         sys.exit(f"Run with N={N} failed (exit code {result.returncode}):\n{result.stdout}{result.stderr}")
 
-    gflops = GFLOPS_RE.search(result.stdout)
-    avg_time = AVG_TIME_RE.search(result.stdout)
-    if gflops is None or avg_time is None:
-        sys.exit(f"Could not parse the output for N={N}:\n{result.stdout}")
-    return float(avg_time.group(1)), float(gflops.group(1))
+    matches = {
+        "avg_time_us": avg_time_re(LABEL_TRANSFER).search(result.stdout),
+        "gflops": gflops_re(LABEL_TRANSFER).search(result.stdout),
+        "compute_time_us": avg_time_re(LABEL_COMPUTE).search(result.stdout),
+        "compute_gflops": gflops_re(LABEL_COMPUTE).search(result.stdout),
+    }
+    missing = [name for name, m in matches.items() if m is None]
+    if missing:
+        sys.exit(f"Could not parse {missing} from the output for N={N}:\n{result.stdout}")
+    return {name: float(m.group(1)) for name, m in matches.items()}
 
 
 def create_monitor(enabled):
@@ -182,10 +197,12 @@ def main():
             for N in args.sizes:
                 if monitor:
                     monitor.start()
-                avg_time, gflops = run_one(N, args.iterations, args.warmup)
+                timing = run_one(N, args.iterations, args.warmup)
                 gpu = monitor.stop() if monitor else EMPTY_MONITOR
-                writer.writerow([N, args.iterations, avg_time, gflops] + [gpu[c] for c in MONITOR_COLUMNS])
-                line = f"N = {N:6d}   avg time = {avg_time:12.1f} us   {gflops:10.2f} GFLOP/s"
+                writer.writerow([N, args.iterations] + [timing[c] for c in TIMING_COLUMNS]
+                                + [gpu[c] for c in MONITOR_COLUMNS])
+                line = (f"N = {N:6d}   with transfer: {timing['avg_time_us']:12.1f} us {timing['gflops']:9.1f} GFLOP/s"
+                        f"   compute only: {timing['compute_time_us']:12.1f} us {timing['compute_gflops']:9.1f} GFLOP/s")
                 if monitor:
                     line += (f"   active samples {gpu['active_samples']}"
                              f"   SM clock avg {gpu['sm_clock_avg_mhz']} MHz (min {gpu['sm_clock_min_mhz']})"

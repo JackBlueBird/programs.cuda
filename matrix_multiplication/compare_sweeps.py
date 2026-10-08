@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Compare two CSV files produced by run_sweep.py (e.g. laptop in power saver vs performance mode):
-one figure with the same 6 panels of plot_sweep.py, each with both sweeps as two lines.
+one figure with the same panels of plot_sweep.py, each with both sweeps as two lines.
 
 usage:
     python3 compare_sweeps.py powersaver.csv performance.csv
@@ -11,7 +11,8 @@ usage:
 import argparse
 from pathlib import Path
 
-from plot_sweep import PANELS, TEXT_PRIMARY, overview_grid, read_csv, save, style_axes, valid_points
+from plot_sweep import (PANELS, TEXT_PRIMARY, overview_grid, read_csv, save, share_y_scale,
+                        style_axes, valid_points)
 
 # two series: fixed order of the categorical palette (blue, orange) + different marker shapes,
 # so the sweeps are told apart also without color
@@ -22,7 +23,7 @@ SERIES_STYLE = [
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare two sweep CSV files in one 6-panel figure")
+    parser = argparse.ArgumentParser(description="Compare two sweep CSV files in one multi-panel figure")
     parser.add_argument("csv_a", help="first CSV from run_sweep.py")
     parser.add_argument("csv_b", help="second CSV from run_sweep.py")
     parser.add_argument("--labels", nargs=2, metavar=("LABEL_A", "LABEL_B"),
@@ -55,6 +56,7 @@ def main():
             ax.annotate(value_format.format(y[-1]), (x[-1], y[-1]), textcoords="offset points",
                         xytext=(0, offset), ha="center", color=TEXT_PRIMARY, fontsize=8)
         style_axes(ax, title, ylabel, max(max(y) for _, y in series))
+    share_y_scale(axes, panels)
 
     # one legend for the whole figure, above the panels
     handles, legend_labels = axes[0].get_legend_handles_labels()

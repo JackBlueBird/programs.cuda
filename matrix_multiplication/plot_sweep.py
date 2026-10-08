@@ -3,7 +3,8 @@
 Read the CSV produced by run_sweep.py and create, as a function of the matrix size N:
 - <prefix>_gflops.png and <prefix>_avg_time.png: GFLOP/s and average time, one figure each
 - <prefix>_overview.png: one figure with a panel per logged quantity:
-  GFLOP/s, average time, SM clock average and minimum, maximum temperature, average power.
+  GFLOP/s with transfer and computation only, average time, maximum temperature,
+  SM clock average and minimum, average power.
   Monitor values can be missing for some N (short runs with no active GPU sample): those points
   are skipped; a panel with no data at all (e.g. sweep run with --no-monitor) is not drawn.
 
@@ -32,13 +33,16 @@ SURFACE = "#fcfcfb"
 # panels in order: (CSV column, panel title, y label, scale factor, format of the last value)
 PANELS = [
     ("gflops",           "Performance (computation + data transfer)", "GFLOP/s",   1.0,   "{:.0f}"),
-    ("avg_time_us",      "Average time per iteration",                "time [ms]", 1e-3,  "{:.1f} ms"),
+    ("compute_gflops",   "Performance (computation only)",            "GFLOP/s",   1.0,   "{:.0f}"),
+    ("avg_time_us",      "Average time per iteration (+ transfer)",   "time [ms]", 1e-3,  "{:.1f} ms"),
+    ("temp_max_c",       "GPU temperature, maximum",                  "°C",        1.0,   "{:.0f} °C"),
     ("sm_clock_avg_mhz", "SM clock, average (GPU active)",            "MHz",       1.0,   "{:.0f} MHz"),
     ("sm_clock_min_mhz", "SM clock, minimum (GPU active)",            "MHz",       1.0,   "{:.0f} MHz"),
-    ("temp_max_c",       "GPU temperature, maximum",                  "°C",        1.0,   "{:.0f} °C"),
     ("power_avg_w",      "GPU power, average (GPU active)",           "W",         1.0,   "{:.1f} W"),
 ]
 N_COLS = 2
+# panels drawn with the same y scale, so they can be compared at a glance
+SAME_SCALE = ("gflops", "compute_gflops")
 
 
 def read_csv(path):
@@ -107,6 +111,15 @@ def overview_grid(n_panels):
     return fig, axes
 
 
+def share_y_scale(axes, panels):
+    """give the SAME_SCALE panels (if drawn) the same y range: from 0 to the largest top"""
+    same = [ax for ax, p in zip(axes, panels) if p[0] in SAME_SCALE]
+    if len(same) > 1:
+        top = max(ax.get_ylim()[1] for ax in same)
+        for ax in same:
+            ax.set_ylim(0, top)
+
+
 def save(fig, filename, top=1.0):
     """top < 1 leaves room above the panels (e.g. for a figure legend)"""
     fig.tight_layout(rect=(0, 0, 1, top))
@@ -140,6 +153,7 @@ def main():
     fig, axes = overview_grid(len(panels))
     for ax, (name, title, ylabel, _, value_format) in zip(axes, panels):
         draw_panel(ax, N, columns[name], title, ylabel, value_format)
+    share_y_scale(axes, panels)
     fig.suptitle(f"cuBLAS SGEMM sweep ({args.input})", color=TEXT_PRIMARY, x=0.01, ha="left", fontsize=12)
     save(fig, f"{args.prefix}_overview.png")
 
