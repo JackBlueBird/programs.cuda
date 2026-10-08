@@ -1,0 +1,38 @@
+OLD vs NEW cuBLAS SGEMM benchmark
+=================================
+
+Files
+  gpu_performance_cuda.pdf   old benchmark (matrix_multiply.cu)
+  benchmark_example.png      new benchmark (matrix_multiply_REDONE.cu), with and without charger
+
+SGEMM, GFLOP/s, computation + data transfer (new: laptop with charger)
+
+  N       old     new     new / old
+  500       4     543     x136
+  1000     33    1267     x38
+  1500    102    1808     x18
+  2000    232    2279     x10
+  2500    406    2817     x7
+  3000    683    3167     x4.6
+  3500    974    3358     x3.4
+
+Why the old numbers are so low
+  - The old program timed ONE call, the FIRST one, with no warm up.
+  - The first cuBLAS call pays the library initialization: a fixed cost of tens of ms.
+  - At small N the real computation takes less than 1 ms, so the old time was almost all initialization.
+    The fixed cost weighs less as N grows: the ratio goes from x136 down to x3.4.
+  - Proof inside the old plot: STRMM looks faster than SGEMM at every N. It was called AFTER SGEMM,
+    when cuBLAS was already initialized, so it got the warm up that SGEMM had paid for.
+
+Other differences
+  - Correctness: the old SGEMM call (CUBLAS_OP_T, CUBLAS_OP_T) returned C transposed; with constant
+    matrices it could not be seen. The new one uses random matrices and is verified against the CPU.
+  - Statistics: old = 1 measurement; new = warm up + average of several iterations.
+  - Range: old up to N = 3500; new up to N = 15000, where the plateau (GPU power limit) shows up.
+  - New also measures computation only (~5.3 TFLOP/s with charger, ~3.7 on battery at large N).
+  - Hardware of the old plot not recorded (compile notes suggest sm_86, maybe the cluster):
+    part of the difference could come from a different GPU.
+
+Lesson
+  Always warm up before timing a GPU library. A single detail of method underestimated cuBLAS
+  by up to 100 times.

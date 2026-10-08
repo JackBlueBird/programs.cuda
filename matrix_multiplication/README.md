@@ -10,6 +10,9 @@ including host <-> device copies, and computation only.
 - `run_sweep.py`: run for many N, write a CSV
 - `plot_sweep.py`: plots from the CSV
 - `compare_sweeps.py`: compares two CSV files in one multi-panel figure
+- `gpu_performance_cuda.pdf`: results of the OLD benchmark (`matrix_multiply.cu`)
+- `benchmark_example.png`: results of the NEW benchmark, with and without charger
+- `old_vs_new_benchmark.txt`: why the old and new SGEMM numbers differ so much
 
 ## Executable
 
@@ -28,6 +31,8 @@ including host <-> device copies, and computation only.
 - **Both in one step**: `./compile_and_run.sh [N] [ITERATIONS] [WARMUP]` (defaults 1000, 10, 5)
     - `-arch=sm_89` = compute capability 8.9 (RTX 40); change it for other GPUs
 - **Memory**: `12 * N^2` bytes on host and on device (N = 10000 -> 1.2 GB)
+- **Device stats**
+    `nvidia-smi -q -d POWER | grep -i "power limit"`
 
 ## Output
 
